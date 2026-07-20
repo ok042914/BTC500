@@ -21,7 +21,7 @@ JST = ZoneInfo("Asia/Tokyo")
 UTC = ZoneInfo("UTC")
 CACHE_TTL_SEC = 6 * 3600
 
-COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+# モジュールレベルでも読んでおくが、関数内で毎回 os.environ から取り直す
 
 # ---------- インメモリキャッシュ ----------
 # Vercel Fluid Compute ではインスタンスが再利用されるため有効。
@@ -48,10 +48,15 @@ async def _fetch_prices() -> tuple[list, bool]:
     if fresh:
         return cached_prices, True
 
+    # 毎リクエストで読み直す（モジュールキャッシュの影響を避けるため）
+    api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
+
     try:
         headers: dict[str, str] = {"Accept": "application/json"}
-        if COINGECKO_API_KEY:
-            headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+        if api_key:
+            # Demo キー（CG-xxx 形式）と Pro キー両方に対応
+            headers["x-cg-demo-api-key"] = api_key
+            headers["x-cg-pro-api-key"] = api_key
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.get(
                 "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
@@ -66,11 +71,12 @@ async def _fetch_prices() -> tuple[list, bool]:
         if cached_prices is not None:
             return cached_prices, True
         hint = ""
-        if not COINGECKO_API_KEY and "401" in str(exc):
+        if not api_key and "401" in str(exc):
             hint = " — 環境変数 COINGECKO_API_KEY を設定してください（Vercel Dashboard → Settings → Environment Variables）"
+        key_hint = f"key_prefix={api_key[:4]}..." if api_key else "key=未設定"
         raise HTTPException(
             status_code=503,
-            detail=f"CoinGecko API エラー: {exc}{hint}",
+            detail=f"CoinGecko API エラー ({key_hint}): {exc}{hint}",
         )
 
 
