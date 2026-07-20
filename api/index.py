@@ -52,7 +52,7 @@ def _build_headers() -> dict[str, str]:
 
 
 async def _fetch_chunked(client: httpx.AsyncClient) -> list:
-    """Demo プラン向け: 360日ごとに並列リクエストして全期間を取得"""
+    """Demo プラン向け: 360日ごとに順次リクエスト（レート制限: 30回/分）"""
     # 2020-01-01 から現在まで取得（実用的な開始日をすべてカバー）
     chunk_start = datetime(2020, 1, 1, tzinfo=UTC)
     now = datetime.now(UTC)
@@ -65,25 +65,31 @@ async def _fetch_chunked(client: httpx.AsyncClient) -> list:
         cur = chunk_end + timedelta(seconds=1)
 
     headers = _build_headers()
-
-    async def _fetch_one(s: datetime, e: datetime) -> list:
-        try:
-            r = await client.get(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range",
-                params={"vs_currency": "jpy", "from": int(s.timestamp()), "to": int(e.timestamp())},
-                headers=headers,
-            )
-            if r.status_code == 200:
-                return r.json().get("prices", [])
-        except Exception:
-            pass
-        return []
-
-    results = await asyncio.gather(*[_fetch_one(s, e) for s, e in chunks])
-
     all_prices: list = []
-    for chunk_prices in results:
-        all_prices.extend(chunk_prices)
+
+    for i, (s, e) in enumerate(chunks):
+        if i > 0:
+            await asyncio.sleep(2.5)  # 30回/分 = 2秒/リクエスト、余裕を持って 2.5秒
+
+        for attempt in range(3):
+            try:
+                r = await client.get(
+                    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range",
+                    params={"vs_currency": "jpy", "from": int(s.timestamp()), "to": int(e.timestamp())},
+                    headers=headers,
+                )
+                if r.status_code == 200:
+                    all_prices.extend(r.json().get("prices", []))
+                    break
+                elif r.status_code == 429:
+                    # レート制限: 指数バックオフ
+                    await asyncio.sleep(10 * (attempt + 1))
+                else:
+                    break  # その他エラーはスキップ
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(3)
+
     all_prices.sort(key=lambda x: x[0])
     return all_prices
 
@@ -205,7 +211,7 @@ async def check_key():
     }
     headers = _build_headers()
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get("https://api.coingecko.com/api/v3/ping", headers=headers)
             result["ping_status"] = r.status_code
             result["ping_ok"] = r.status_code == 200
@@ -223,6 +229,19 @@ async def check_key():
                 headers=headers,
             )
             result["days_max_status"] = r3.status_code
+
+            # range エンドポイントで 2022年のデータが取れるか確認
+            import time
+            from_ts = int(datetime(2022, 1, 1, tzinfo=UTC).timestamp())
+            to_ts = int(datetime(2022, 12, 31, tzinfo=UTC).timestamp())
+            r4 = await client.get(
+                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range",
+                params={"vs_currency": "jpy", "from": from_ts, "to": to_ts},
+                headers=headers,
+            )
+            result["range_2022_status"] = r4.status_code
+            if r4.status_code == 200:
+                result["range_2022_count"] = len(r4.json().get("prices", []))
     except Exception as e:
         result["error"] = str(e)
     return result
