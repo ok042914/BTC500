@@ -1,12 +1,13 @@
+import asyncio
+import os
+from collections import defaultdict
+from datetime import datetime, timedelta, date
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import httpx
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
-from collections import defaultdict
-import json
-import os
-from typing import Optional
 
 app = FastAPI(title="BTC Accumulation Simulator")
 
@@ -21,11 +22,7 @@ JST = ZoneInfo("Asia/Tokyo")
 UTC = ZoneInfo("UTC")
 CACHE_TTL_SEC = 6 * 3600
 
-# モジュールレベルでも読んでおくが、関数内で毎回 os.environ から取り直す
-
 # ---------- インメモリキャッシュ ----------
-# Vercel Fluid Compute ではインスタンスが再利用されるため有効。
-# コールドスタート時は空になる。
 _mem_cache: dict = {}
 
 
@@ -35,7 +32,7 @@ def _load_cache() -> tuple[list | None, bool]:
     age = datetime.now().timestamp() - _mem_cache["cached_at"]
     if age < CACHE_TTL_SEC:
         return _mem_cache["prices"], True
-    return _mem_cache["prices"], False  # 期限切れでもフォールバック用に返す
+    return _mem_cache["prices"], False
 
 
 def _save_cache(prices: list) -> None:
@@ -43,43 +40,101 @@ def _save_cache(prices: list) -> None:
     _mem_cache["cached_at"] = datetime.now().timestamp()
 
 
+def _build_headers() -> dict[str, str]:
+    api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if api_key:
+        if api_key.startswith("CG-"):
+            headers["x-cg-demo-api-key"] = api_key
+        else:
+            headers["x-cg-pro-api-key"] = api_key
+    return headers
+
+
+async def _fetch_chunked(client: httpx.AsyncClient) -> list:
+    """Demo プラン向け: 360日ごとに並列リクエストして全期間を取得"""
+    # 2020-01-01 から現在まで取得（実用的な開始日をすべてカバー）
+    chunk_start = datetime(2020, 1, 1, tzinfo=UTC)
+    now = datetime.now(UTC)
+
+    chunks: list[tuple[datetime, datetime]] = []
+    cur = chunk_start
+    while cur < now:
+        chunk_end = min(cur + timedelta(days=360), now)
+        chunks.append((cur, chunk_end))
+        cur = chunk_end + timedelta(seconds=1)
+
+    headers = _build_headers()
+
+    async def _fetch_one(s: datetime, e: datetime) -> list:
+        try:
+            r = await client.get(
+                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range",
+                params={"vs_currency": "jpy", "from": int(s.timestamp()), "to": int(e.timestamp())},
+                headers=headers,
+            )
+            if r.status_code == 200:
+                return r.json().get("prices", [])
+        except Exception:
+            pass
+        return []
+
+    results = await asyncio.gather(*[_fetch_one(s, e) for s, e in chunks])
+
+    all_prices: list = []
+    for chunk_prices in results:
+        all_prices.extend(chunk_prices)
+    all_prices.sort(key=lambda x: x[0])
+    return all_prices
+
+
 async def _fetch_prices() -> tuple[list, bool]:
     cached_prices, fresh = _load_cache()
     if fresh:
         return cached_prices, True
 
-    # 毎リクエストで読み直す（モジュールキャッシュの影響を避けるため）
-    api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
+    headers = _build_headers()
 
     try:
-        headers: dict[str, str] = {"Accept": "application/json"}
-        if api_key:
-            # CG- で始まる場合は Demo キー、それ以外は Pro キー
-            if api_key.startswith("CG-"):
-                headers["x-cg-demo-api-key"] = api_key
-            else:
-                headers["x-cg-pro-api-key"] = api_key
         async with httpx.AsyncClient(timeout=60) as client:
+            # まず days=max を試す（Pro プランや旧来の公開 API で有効）
             resp = await client.get(
                 "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
                 params={"vs_currency": "jpy", "days": "max"},
                 headers=headers,
             )
+            if resp.status_code == 200:
+                prices = resp.json()["prices"]
+                _save_cache(prices)
+                return prices, False
+
+            if resp.status_code in (401, 403):
+                # Demo プランは days=max 非対応 → 360日チャンクで並列取得
+                prices = await _fetch_chunked(client)
+                if prices:
+                    _save_cache(prices)
+                    return prices, False
+
             resp.raise_for_status()
-            prices = resp.json()["prices"]
-            _save_cache(prices)
-            return prices, False
+
+    except HTTPException:
+        raise
     except Exception as exc:
         if cached_prices is not None:
             return cached_prices, True
+        api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
         hint = ""
-        if not api_key and "401" in str(exc):
-            hint = " — 環境変数 COINGECKO_API_KEY を設定してください（Vercel Dashboard → Settings → Environment Variables）"
-        key_hint = f"key_prefix={api_key[:4]}..." if api_key else "key=未設定"
+        if not api_key:
+            hint = " — 環境変数 COINGECKO_API_KEY を設定してください"
+        key_info = f"key_prefix={api_key[:4]}..." if api_key else "key=未設定"
         raise HTTPException(
             status_code=503,
-            detail=f"CoinGecko API エラー ({key_hint}): {exc}{hint}",
+            detail=f"CoinGecko API エラー ({key_info}): {exc}{hint}",
         )
+
+    if cached_prices is not None:
+        return cached_prices, True
+    raise HTTPException(status_code=503, detail="価格データを取得できません")
 
 
 # ---------- JST 9:00 価格抽出 ----------
@@ -142,50 +197,34 @@ async def health():
 
 @app.get("/api/check-key")
 async def check_key():
-    """APIキーの有効性を確認するデバッグエンドポイント"""
     api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
     result: dict = {
         "key_set": bool(api_key),
         "key_prefix": api_key[:6] + "..." if api_key else "(未設定)",
         "key_type": "demo" if api_key.startswith("CG-") else ("pro" if api_key else "none"),
     }
+    headers = _build_headers()
     try:
-        headers: dict[str, str] = {"Accept": "application/json"}
-        if api_key.startswith("CG-"):
-            headers["x-cg-demo-api-key"] = api_key
-        else:
-            headers["x-cg-pro-api-key"] = api_key
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                "https://api.coingecko.com/api/v3/ping",
-                headers=headers,
-            )
+            r = await client.get("https://api.coingecko.com/api/v3/ping", headers=headers)
             result["ping_status"] = r.status_code
             result["ping_ok"] = r.status_code == 200
-            result["ping_body"] = r.json()
 
-            # days=365 で market_chart をテスト
             r2 = await client.get(
                 "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
                 params={"vs_currency": "jpy", "days": "365"},
                 headers=headers,
             )
-            result["market_chart_365_status"] = r2.status_code
-            result["market_chart_365_ok"] = r2.status_code == 200
-            if r2.status_code == 200:
-                prices = r2.json().get("prices", [])
-                result["market_chart_365_count"] = len(prices)
+            result["days_365_status"] = r2.status_code
 
-            # days=max で market_chart をテスト
             r3 = await client.get(
                 "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
                 params={"vs_currency": "jpy", "days": "max"},
                 headers=headers,
             )
-            result["market_chart_max_status"] = r3.status_code
-            result["market_chart_max_ok"] = r3.status_code == 200
+            result["days_max_status"] = r3.status_code
     except Exception as e:
-        result["ping_error"] = str(e)
+        result["error"] = str(e)
     return result
 
 
