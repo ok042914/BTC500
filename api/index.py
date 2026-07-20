@@ -155,7 +155,7 @@ async def check_key():
             headers["x-cg-demo-api-key"] = api_key
         else:
             headers["x-cg-pro-api-key"] = api_key
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
                 "https://api.coingecko.com/api/v3/ping",
                 headers=headers,
@@ -163,6 +163,27 @@ async def check_key():
             result["ping_status"] = r.status_code
             result["ping_ok"] = r.status_code == 200
             result["ping_body"] = r.json()
+
+            # days=365 で market_chart をテスト
+            r2 = await client.get(
+                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                params={"vs_currency": "jpy", "days": "365"},
+                headers=headers,
+            )
+            result["market_chart_365_status"] = r2.status_code
+            result["market_chart_365_ok"] = r2.status_code == 200
+            if r2.status_code == 200:
+                prices = r2.json().get("prices", [])
+                result["market_chart_365_count"] = len(prices)
+
+            # days=max で market_chart をテスト
+            r3 = await client.get(
+                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                params={"vs_currency": "jpy", "days": "max"},
+                headers=headers,
+            )
+            result["market_chart_max_status"] = r3.status_code
+            result["market_chart_max_ok"] = r3.status_code == 200
     except Exception as e:
         result["ping_error"] = str(e)
     return result
