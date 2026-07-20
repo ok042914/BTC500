@@ -54,9 +54,11 @@ async def _fetch_prices() -> tuple[list, bool]:
     try:
         headers: dict[str, str] = {"Accept": "application/json"}
         if api_key:
-            # Demo キー（CG-xxx 形式）と Pro キー両方に対応
-            headers["x-cg-demo-api-key"] = api_key
-            headers["x-cg-pro-api-key"] = api_key
+            # CG- で始まる場合は Demo キー、それ以外は Pro キー
+            if api_key.startswith("CG-"):
+                headers["x-cg-demo-api-key"] = api_key
+            else:
+                headers["x-cg-pro-api-key"] = api_key
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.get(
                 "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
