@@ -140,6 +140,34 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/check-key")
+async def check_key():
+    """APIキーの有効性を確認するデバッグエンドポイント"""
+    api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
+    result: dict = {
+        "key_set": bool(api_key),
+        "key_prefix": api_key[:6] + "..." if api_key else "(未設定)",
+        "key_type": "demo" if api_key.startswith("CG-") else ("pro" if api_key else "none"),
+    }
+    try:
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if api_key.startswith("CG-"):
+            headers["x-cg-demo-api-key"] = api_key
+        else:
+            headers["x-cg-pro-api-key"] = api_key
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://api.coingecko.com/api/v3/ping",
+                headers=headers,
+            )
+            result["ping_status"] = r.status_code
+            result["ping_ok"] = r.status_code == 200
+            result["ping_body"] = r.json()
+    except Exception as e:
+        result["ping_error"] = str(e)
+    return result
+
+
 @app.get("/api/simulate")
 async def simulate(
     start_date: str = Query("2021-10-25"),
