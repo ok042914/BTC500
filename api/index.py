@@ -40,7 +40,7 @@ def _save_cache(prices: list) -> None:
     _mem_cache["cached_at"] = datetime.now().timestamp()
 
 
-def _build_headers() -> dict[str, str]:
+def _build_cg_headers() -> dict[str, str]:
     api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
     headers: dict[str, str] = {"Accept": "application/json"}
     if api_key:
@@ -51,47 +51,65 @@ def _build_headers() -> dict[str, str]:
     return headers
 
 
-async def _fetch_chunked(client: httpx.AsyncClient) -> list:
-    """Demo プラン向け: 360日ごとに順次リクエスト（レート制限: 30回/分）"""
-    # 2020-01-01 から現在まで取得（実用的な開始日をすべてカバー）
-    chunk_start = datetime(2020, 1, 1, tzinfo=UTC)
-    now = datetime.now(UTC)
+# ---------- データ取得 ----------
 
-    chunks: list[tuple[datetime, datetime]] = []
-    cur = chunk_start
-    while cur < now:
-        chunk_end = min(cur + timedelta(days=360), now)
-        chunks.append((cur, chunk_end))
-        cur = chunk_end + timedelta(seconds=1)
+async def _fetch_yahoo(client: httpx.AsyncClient) -> list:
+    """
+    Yahoo Finance から BTC-JPY の全期間日足データを取得（認証不要）。
+    タイムスタンプは UTC 00:00 = JST 09:00 に対応する。
+    """
+    r = await client.get(
+        "https://query1.finance.yahoo.com/v8/finance/chart/BTC-JPY",
+        params={"interval": "1d", "range": "10y"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; BTC500/1.0)",
+            "Accept": "application/json",
+        },
+    )
+    r.raise_for_status()
+    result = r.json()["chart"]["result"][0]
+    timestamps = result["timestamp"]
+    closes = result["indicators"]["quote"][0]["close"]
+    return sorted(
+        [[ts * 1000, price] for ts, price in zip(timestamps, closes) if price is not None],
+        key=lambda x: x[0],
+    )
 
-    headers = _build_headers()
-    all_prices: list = []
 
-    for i, (s, e) in enumerate(chunks):
-        if i > 0:
-            await asyncio.sleep(2.5)  # 30回/分 = 2秒/リクエスト、余裕を持って 2.5秒
+async def _fetch_cg_recent(client: httpx.AsyncClient) -> list:
+    """
+    CoinGecko から直近 90 日の時間足データを取得。
+    Demo プランで動作確認済み（days=90 < 365 の制限内）。
+    失敗時は空リストを返す（Yahoo のみで続行）。
+    """
+    try:
+        r = await client.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            params={"vs_currency": "jpy", "days": "90"},
+            headers=_build_cg_headers(),
+        )
+        if r.status_code == 200:
+            return r.json().get("prices", [])
+    except Exception:
+        pass
+    return []
 
-        for attempt in range(3):
-            try:
-                r = await client.get(
-                    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range",
-                    params={"vs_currency": "jpy", "from": int(s.timestamp()), "to": int(e.timestamp())},
-                    headers=headers,
-                )
-                if r.status_code == 200:
-                    all_prices.extend(r.json().get("prices", []))
-                    break
-                elif r.status_code == 429:
-                    # レート制限: 指数バックオフ
-                    await asyncio.sleep(10 * (attempt + 1))
-                else:
-                    break  # その他エラーはスキップ
-            except Exception:
-                if attempt < 2:
-                    await asyncio.sleep(3)
 
-    all_prices.sort(key=lambda x: x[0])
-    return all_prices
+def _merge_prices(yahoo_prices: list, cg_prices: list) -> list:
+    """
+    Yahoo（日足）と CoinGecko（時間足）をマージ。
+    重複タイムスタンプは CoinGecko 優先（より高精度）。
+    直近 90 日は CoinGecko、それ以前は Yahoo を使う。
+    """
+    if not cg_prices:
+        return yahoo_prices
+
+    # CoinGecko のカバー範囲の開始タイムスタンプ
+    cg_start_ms = cg_prices[0][0]
+
+    merged = [p for p in yahoo_prices if p[0] < cg_start_ms] + cg_prices
+    merged.sort(key=lambda x: x[0])
+    return merged
 
 
 async def _fetch_prices() -> tuple[list, bool]:
@@ -99,48 +117,26 @@ async def _fetch_prices() -> tuple[list, bool]:
     if fresh:
         return cached_prices, True
 
-    headers = _build_headers()
-
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            # まず days=max を試す（Pro プランや旧来の公開 API で有効）
-            resp = await client.get(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-                params={"vs_currency": "jpy", "days": "max"},
-                headers=headers,
+        async with httpx.AsyncClient(timeout=30) as client:
+            yahoo_prices, cg_prices = await asyncio.gather(
+                _fetch_yahoo(client),
+                _fetch_cg_recent(client),
             )
-            if resp.status_code == 200:
-                prices = resp.json()["prices"]
-                _save_cache(prices)
-                return prices, False
 
-            if resp.status_code in (401, 403):
-                # Demo プランは days=max 非対応 → 360日チャンクで並列取得
-                prices = await _fetch_chunked(client)
-                if prices:
-                    _save_cache(prices)
-                    return prices, False
+        prices = _merge_prices(yahoo_prices, cg_prices)
+        if not prices:
+            raise ValueError("価格データが空です")
+        _save_cache(prices)
+        return prices, False
 
-            resp.raise_for_status()
-
-    except HTTPException:
-        raise
     except Exception as exc:
         if cached_prices is not None:
             return cached_prices, True
-        api_key = os.environ.get("COINGECKO_API_KEY", "").strip()
-        hint = ""
-        if not api_key:
-            hint = " — 環境変数 COINGECKO_API_KEY を設定してください"
-        key_info = f"key_prefix={api_key[:4]}..." if api_key else "key=未設定"
         raise HTTPException(
             status_code=503,
-            detail=f"CoinGecko API エラー ({key_info}): {exc}{hint}",
+            detail=f"価格データ取得エラー: {exc}",
         )
-
-    if cached_prices is not None:
-        return cached_prices, True
-    raise HTTPException(status_code=503, detail="価格データを取得できません")
 
 
 # ---------- JST 9:00 価格抽出 ----------
@@ -207,41 +203,26 @@ async def check_key():
     result: dict = {
         "key_set": bool(api_key),
         "key_prefix": api_key[:6] + "..." if api_key else "(未設定)",
-        "key_type": "demo" if api_key.startswith("CG-") else ("pro" if api_key else "none"),
+        "data_source": "Yahoo Finance (historical) + CoinGecko 90d (recent)",
     }
-    headers = _build_headers()
+    headers = _build_cg_headers()
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get("https://api.coingecko.com/api/v3/ping", headers=headers)
-            result["ping_status"] = r.status_code
-            result["ping_ok"] = r.status_code == 200
+            yf_r = await client.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/BTC-JPY",
+                params={"interval": "1d", "range": "1mo"},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            result["yahoo_status"] = yf_r.status_code
+            result["yahoo_ok"] = yf_r.status_code == 200
 
-            r2 = await client.get(
+            cg_r = await client.get(
                 "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-                params={"vs_currency": "jpy", "days": "365"},
+                params={"vs_currency": "jpy", "days": "90"},
                 headers=headers,
             )
-            result["days_365_status"] = r2.status_code
-
-            r3 = await client.get(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-                params={"vs_currency": "jpy", "days": "max"},
-                headers=headers,
-            )
-            result["days_max_status"] = r3.status_code
-
-            # range エンドポイントで 2022年のデータが取れるか確認
-            import time
-            from_ts = int(datetime(2022, 1, 1, tzinfo=UTC).timestamp())
-            to_ts = int(datetime(2022, 12, 31, tzinfo=UTC).timestamp())
-            r4 = await client.get(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range",
-                params={"vs_currency": "jpy", "from": from_ts, "to": to_ts},
-                headers=headers,
-            )
-            result["range_2022_status"] = r4.status_code
-            if r4.status_code == 200:
-                result["range_2022_count"] = len(r4.json().get("prices", []))
+            result["coingecko_90d_status"] = cg_r.status_code
+            result["coingecko_90d_ok"] = cg_r.status_code == 200
     except Exception as e:
         result["error"] = str(e)
     return result
